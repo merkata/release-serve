@@ -102,7 +102,7 @@ jobs:
         run: mvn test
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}
           path: target/*.jar
