@@ -221,14 +221,14 @@ jobs:
           fi
       
       - name: Update Version (Maven)
-        if: ${{ inputs.project_type == 'maven' && steps.semver.outputs.version_changed == 'true' }}
+        if: ${{ inputs.project_type == 'maven' && steps.semantic_release.outputs.version_changed == 'true' }}
         run: |
-          mvn versions:set -DnewVersion=${{ steps.semver.outputs.new_version }} -DgenerateBackupPoms=false
+          mvn versions:set -DnewVersion=${{ steps.semantic_release.outputs.new_version }} -DgenerateBackupPoms=false
       
       - name: Update Version (Node)
-        if: ${{ inputs.project_type == 'node' && steps.semver.outputs.version_changed == 'true' }}
+        if: ${{ inputs.project_type == 'node' && steps.semantic_release.outputs.version_changed == 'true' }}
         run: |
-          npm version ${{ steps.semver.outputs.new_version }} --no-git-tag-version
+          npm version ${{ steps.semantic_release.outputs.new_version }} --no-git-tag-version
       
       - name: Create Git Tag
         if: ${{ steps.semantic_release.outputs.version_changed == 'true' }}
