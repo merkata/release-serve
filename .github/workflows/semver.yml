@@ -93,7 +93,9 @@ jobs:
               "master",
               {"name": "develop", "prerelease": "dev"},
               {"name": "release/*", "prerelease": "rc"},
-              {"name": "feature/*", "prerelease": "alpha"}
+              {"name": "feature/*", "prerelease": "alpha"},
+              {"name": "bugfix/*", "prerelease": "beta"},
+              {"name": "hotfix/*", "prerelease": "beta"}
             ],
             "plugins": [
               ["@semantic-release/commit-analyzer", {
@@ -112,10 +114,7 @@ jobs:
                   {"scope": "deps", "release": "patch"}
                 ]
               }],
-              "@semantic-release/release-notes-generator",
-              ["@semantic-release/exec", {
-                "verifyReleaseCmd": "echo 'NEXT_VERSION=${nextRelease.version}' >> $GITHUB_ENV"
-              }]
+              "@semantic-release/release-notes-generator"
             ]
           }
           EOF
@@ -128,34 +127,33 @@ jobs:
           PRERELEASE: ${{ inputs.prerelease }}
           CURRENT_VERSION: ${{ steps.maven_version.outputs.current_version || steps.node_version.outputs.current_version }}
         run: |
+          # Create temporary file to capture semantic-release output
+          mkdir -p ./semver
+          echo "" > ./semver/release.txt
+          
           # Run semantic-release in dry-run mode to analyze which release type would be performed
-          npx semantic-release --dry-run
-
+          npx semantic-release --dry-run | tee ./semver/release.txt
+          
+          # Extract the version that semantic-release would create
+          SEMANTIC_VERSION=$(grep -o "The next release version is [0-9]\+\.[0-9]\+\.[0-9]\+" ./semver/release.txt | sed 's/The next release version is //')
+          echo "Semantic-release determined version: $SEMANTIC_VERSION"
+          
           # Get the current version components
           IFS='.' read -r -a VERSION_PARTS <<< "$CURRENT_VERSION"
           MAJOR="${VERSION_PARTS[0]}"
           MINOR="${VERSION_PARTS[1]}"
           PATCH="${VERSION_PARTS[2]%%[-+]*}"  # Remove any pre-release or build metadata
-
-          # If semantic-release determined a new version, use it, otherwise respect manual override
-          if [[ -n "$NEXT_VERSION" ]]; then
-            echo "semantic-release determined version: $NEXT_VERSION"
-            NEXT_RELEASE_TYPE="auto"
-            
-            # If the next version from semantic-release has major change
-            if [[ "$NEXT_VERSION" == $(($MAJOR+1))\.* ]]; then
-              NEXT_RELEASE_TYPE="major"
-            # If the next version from semantic-release has minor change
-            elif [[ "$NEXT_VERSION" == $MAJOR\.$(($MINOR+1))\.* ]]; then
-              NEXT_RELEASE_TYPE="minor"
-            # If the next version from semantic-release has patch change
-            elif [[ "$NEXT_VERSION" == $MAJOR\.$MINOR\.$(($PATCH+1)) ]]; then
-              NEXT_RELEASE_TYPE="patch"
-            fi
-          fi
           
-          # Manual version strategy takes precedence if specified
-          if [[ "$VERSION_STRATEGY" != "auto" ]]; then
+          # If semantic-release determined a version and we're not overriding, use it
+          if [[ -n "$SEMANTIC_VERSION" && "$VERSION_STRATEGY" == "auto" ]]; then
+            echo "Using semantic-release suggested version: $SEMANTIC_VERSION"
+            IFS='.' read -r -a SEM_PARTS <<< "$SEMANTIC_VERSION"
+            MAJOR="${SEM_PARTS[0]}"
+            MINOR="${SEM_PARTS[1]}"
+            PATCH="${SEM_PARTS[2]}"
+            NEW_VERSION="$SEMANTIC_VERSION"
+          # Otherwise, respect manual version strategy
+          elif [[ "$VERSION_STRATEGY" != "auto" ]]; then
             echo "Manual version strategy detected: $VERSION_STRATEGY"
             if [[ "$VERSION_STRATEGY" == "major" ]]; then
               MAJOR=$((MAJOR + 1))
@@ -168,14 +166,10 @@ jobs:
               PATCH=$((PATCH + 1))
             fi
             NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          # If semantic-release didn't suggest a version and no manual override, increment patch
           else
-            # Use semantic-release suggested version if available
-            if [[ -n "$NEXT_VERSION" ]]; then
-              NEW_VERSION="$NEXT_VERSION"
-            else
-              # Fallback to patch increment if semantic-release doesn't suggest a version
-              NEW_VERSION="${MAJOR}.${MINOR}.$(($PATCH + 1))"
-            fi
+            echo "No specific version determined, incrementing patch version"
+            NEW_VERSION="${MAJOR}.${MINOR}.$(($PATCH + 1))"
           fi
           
           # Determine branch type for prerelease identifier
@@ -198,6 +192,14 @@ jobs:
             NEW_VERSION="${NEW_VERSION}-rc.${GITHUB_RUN_NUMBER}"
             IS_PRERELEASE="true"
             VERSION_CATEGORY="rc"
+          elif [[ "$BRANCH_NAME" == feature/* ]]; then
+            NEW_VERSION="${NEW_VERSION}-alpha.${GITHUB_RUN_NUMBER}"
+            IS_PRERELEASE="true"
+            VERSION_CATEGORY="alpha"
+          elif [[ "$BRANCH_NAME" == bugfix/* || "$BRANCH_NAME" == hotfix/* ]]; then
+            NEW_VERSION="${NEW_VERSION}-beta.${GITHUB_RUN_NUMBER}"
+            IS_PRERELEASE="true"
+            VERSION_CATEGORY="beta"
           elif [[ "$BRANCH_NAME" != "main" && "$BRANCH_NAME" != "master" ]]; then
             NEW_VERSION="${NEW_VERSION}-alpha.${GITHUB_RUN_NUMBER}"
             IS_PRERELEASE="true"
@@ -229,13 +231,14 @@ jobs:
           npm version ${{ steps.semver.outputs.new_version }} --no-git-tag-version
       
       - name: Create Git Tag
-        if: ${{ steps.semver.outputs.version_changed == 'true' }}
+        if: ${{ steps.semantic_release.outputs.version_changed == 'true' }}
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git tag -a v${{ steps.semver.outputs.new_version }} -m "Release v${{ steps.semver.outputs.new_version }}"
           
-          # Don't push tag on non-main branches to avoid conflicts
-          if [[ "${GITHUB_REF#refs/heads/}" == "main" || "${GITHUB_REF#refs/heads/}" == "master" ]]; then
-            git push origin v${{ steps.semver.outputs.new_version }}
-          fi
+          # Create annotated tag
+          echo "Creating tag v${{ steps.semantic_release.outputs.new_version }}"
+          git tag -a "v${{ steps.semantic_release.outputs.new_version }}" -m "Release v${{ steps.semantic_release.outputs.new_version }}"
+          
+          # Push the tag using the provided token
+          git push origin "v${{ steps.semantic_release.outputs.new_version }}"
