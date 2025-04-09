@@ -1,0 +1,239 @@
+# File: .github/workflows/nodejs-build.yml
+# Location: Actions Repository
+
+name: Node.js Build and Publish
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: 'Node.js version to use'
+        required: false
+        default: '16'
+        type: string
+      build_command:
+        description: 'Build command to execute'
+        required: false
+        default: 'npm run build'
+        type: string
+      version_strategy:
+        description: 'The versioning strategy to use (auto, major, minor, patch)'
+        required: false
+        default: 'auto'
+        type: string
+      prerelease:
+        description: 'Custom prerelease identifier (e.g., alpha, beta, rc)'
+        required: false
+        default: ''
+        type: string
+      publish_artifact:
+        description: 'Whether to publish the artifact'
+        required: false
+        default: true
+        type: boolean
+      containerize:
+        description: 'Whether to build a container image'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      artifactory_username:
+        required: false
+      artifactory_password:
+        required: false
+      npm_token:
+        required: false
+      aws_access_key_id:
+        required: false
+      aws_secret_access_key:
+        required: false
+
+jobs:
+  version:
+    name: Calculate Semantic Version
+    uses: ./.github/workflows/semver.yml
+    with:
+      version_strategy: ${{ inputs.version_strategy }}
+      prerelease: ${{ inputs.prerelease }}
+      project_type: 'node'
+  
+  build:
+    name: Build Node.js Project
+    needs: version
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+      
+      - name: Update Version
+        if: ${{ needs.version.outputs.version_changed == 'true' }}
+        run: |
+          npm version ${{ needs.version.outputs.new_version }} --no-git-tag-version
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run tests
+        run: npm test
+      
+      - name: Build
+        run: |
+          # Run build command
+          ${{ inputs.build_command }}
+          
+          # For distributable packages, add version to filename
+          if [ -f "dist/index.js" ] || [ -d "dist/static" ]; then
+            # Create a versioned zip of the dist directory
+            cd dist
+            zip -r "../${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}.zip" .
+            cd ..
+            
+            # Move the zip into dist for artifact upload
+            mv "${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}.zip" dist/
+          fi
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}
+          path: dist/
+      
+      - name: Publish to Artifactory NPM
+        if: ${{ inputs.publish_artifact }}
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.artifactory_username }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.artifactory_password }}
+          VERSION: ${{ needs.version.outputs.new_version }}
+          VERSION_CATEGORY: ${{ needs.version.outputs.version_category }}
+          APP_NAME: ${{ github.event.repository.name }}
+        run: |
+          # Determine repository based on version category
+          if [[ "$VERSION_CATEGORY" == "alpha" || "$VERSION_CATEGORY" == "dev" ]]; then
+            # Alpha and dev versions go to testing repository
+            REPO_URL="https://your-artifactory-url/artifactory/api/npm/npm-testing-repo/"
+            REPO_NAME="testing"
+          elif [[ "$VERSION_CATEGORY" == "rc" || "$VERSION_CATEGORY" == "beta" ]]; then
+            # RC and beta versions go to staging repository
+            REPO_URL="https://your-artifactory-url/artifactory/api/npm/npm-staging-repo/"
+            REPO_NAME="staging"
+          else
+            # Release versions go to release repository
+            REPO_URL="https://your-artifactory-url/artifactory/api/npm/npm-release-repo/"
+            REPO_NAME="release"
+          fi
+          
+          echo "Publishing to $REPO_NAME repository: $REPO_URL"
+          
+          # Create a versioned package.json for publishing
+          jq ".name = \"${APP_NAME}\" | .version = \"${VERSION%.+*}\"" package.json > dist/package.json
+          
+          # Create .npmrc file for Artifactory
+          echo "@yourscope:registry=$REPO_URL" > .npmrc
+          echo "//$REPO_URL:_password=$(echo -n $ARTIFACTORY_PASSWORD | base64)" >> .npmrc
+          echo "//$REPO_URL:username=$ARTIFACTORY_USERNAME" >> .npmrc
+          echo "//$REPO_URL:email=ci@yourtribe.com" >> .npmrc
+          echo "//$REPO_URL:always-auth=true" >> .npmrc
+          
+          # Copy .npmrc to dist for publishing
+          cp .npmrc dist/
+          
+          # Navigate to dist and publish
+          cd dist
+          npm publish --tag ${VERSION_CATEGORY}
+  
+  containerize:
+    name: Build and Push Container
+    needs: [version, build]
+    if: ${{ inputs.containerize }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}
+          path: dist/
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.aws_access_key_id }}
+          aws-secret-access-key: ${{ secrets.aws_secret_access_key }}
+          aws-region: us-east-1
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Determine ECR Repository
+        id: ecr-repo
+        env:
+          VERSION_CATEGORY: ${{ needs.version.outputs.version_category }}
+        run: |
+          # Determine ECR repository based on version category
+          if [[ "$VERSION_CATEGORY" == "alpha" || "$VERSION_CATEGORY" == "dev" ]]; then
+            # Alpha and dev versions go to development ECR
+            echo "repository=your-fe-dev-repository" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION_CATEGORY" == "rc" || "$VERSION_CATEGORY" == "beta" ]]; then
+            # RC and beta versions go to staging ECR
+            echo "repository=your-fe-staging-repository" >> $GITHUB_OUTPUT
+          else
+            # Release versions go to production ECR
+            echo "repository=your-fe-prod-repository" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.repository }}:${{ needs.version.outputs.new_version }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.repository }}:latest
+          build-args: |
+            VERSION=${{ needs.version.outputs.new_version }}
+  
+  create_release:
+    name: Create GitHub Release
+    needs: [version, build]
+    if: ${{ needs.version.outputs.version_changed == 'true' && needs.version.outputs.version_category == 'release' }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}
+          path: ./artifacts/
+      
+      - name: Create zip artifact
+        run: |
+          cd artifacts
+          zip -r "../${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}.zip" ./*
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.version.outputs.new_version }}
+          name: Release v${{ needs.version.outputs.new_version }}
+          draft: false
+          prerelease: ${{ needs.version.outputs.is_prerelease == 'true' }}
+          files: |
+            ${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}.zip
+          generate_release_notes: true

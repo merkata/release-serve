@@ -1,0 +1,245 @@
+name: Maven Build and Publish
+
+on:
+  workflow_call:
+    inputs:
+      java_version:
+        description: 'Java version to use'
+        required: false
+        default: '17'
+        type: string
+      maven_goals:
+        description: 'Maven goals to execute'
+        required: false
+        default: 'clean package'
+        type: string
+      version_strategy:
+        description: 'The versioning strategy to use (auto, major, minor, patch)'
+        required: false
+        default: 'auto'
+        type: string
+      prerelease:
+        description: 'Custom prerelease identifier (e.g., alpha, beta, rc)'
+        required: false
+        default: ''
+        type: string
+      publish_artifact:
+        description: 'Whether to publish the artifact'
+        required: false
+        default: true
+        type: boolean
+      containerize:
+        description: 'Whether to build a container image'
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      artifactory_username:
+        required: false
+      artifactory_password:
+        required: false
+      aws_access_key_id:
+        required: false
+      aws_secret_access_key:
+        required: false
+
+jobs:
+  version:
+    name: Calculate Semantic Version
+    uses: ./.github/workflows/semver.yml
+    with:
+      version_strategy: ${{ inputs.version_strategy }}
+      prerelease: ${{ inputs.prerelease }}
+      project_type: 'maven'
+  
+  build:
+    name: Build Maven Project
+    needs: version
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: ${{ inputs.java_version }}
+          cache: 'maven'
+      
+      - name: Update Version
+        if: ${{ needs.version.outputs.version_changed == 'true' }}
+        run: |
+          mvn versions:set -DnewVersion=${{ needs.version.outputs.new_version }} -DgenerateBackupPoms=false
+      
+      - name: Build with Maven
+        run: |
+          # Run Maven build
+          mvn ${{ inputs.maven_goals }}
+          
+          # Get repository/app name from GitHub context
+          APP_NAME=$(echo "${{ github.repository }}" | awk -F "/" '{print $2}')
+          
+          # Rename output artifacts to include app name and version
+          find target -name "*.jar" -not -name "*-sources.jar" -not -name "*-javadoc.jar" -not -name "*-tests.jar" | while read file; do
+            filename=$(basename "$file")
+            extension="${filename##*.}"
+            filename="${filename%.*}"
+            
+            # Remove existing version if present
+            basename="${filename%-*}"
+            
+            # Create new filename with app name and version
+            new_filename="${APP_NAME}-${{ needs.version.outputs.new_version }}.${extension}"
+            
+            # Rename the file
+            echo "Renaming $file to target/$new_filename"
+            mv "$file" "target/$new_filename"
+          done
+      
+      - name: Run Tests
+        run: mvn test
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}
+          path: target/*.jar
+      
+      - name: Publish to Artifactory
+        if: ${{ inputs.publish_artifact }}
+        env:
+          ARTIFACTORY_USERNAME: ${{ secrets.artifactory_username }}
+          ARTIFACTORY_PASSWORD: ${{ secrets.artifactory_password }}
+          VERSION: ${{ needs.version.outputs.new_version }}
+          VERSION_CATEGORY: ${{ needs.version.outputs.version_category }}
+          APP_NAME: ${{ github.event.repository.name }}
+        run: |
+          # Determine repository based on version category
+          if [[ "$VERSION_CATEGORY" == "alpha" || "$VERSION_CATEGORY" == "dev" ]]; then
+            # Alpha and dev versions go to testing repository
+            REPO_URL="https://your-artifactory-url/artifactory/testing-repo"
+            REPO_NAME="testing"
+          elif [[ "$VERSION_CATEGORY" == "rc" || "$VERSION_CATEGORY" == "beta" ]]; then
+            # RC and beta versions go to staging repository
+            REPO_URL="https://your-artifactory-url/artifactory/staging-repo"
+            REPO_NAME="staging"
+          else
+            # Release versions go to release repository
+            REPO_URL="https://your-artifactory-url/artifactory/release-repo"
+            REPO_NAME="release"
+          fi
+          
+          echo "Publishing to $REPO_NAME repository: $REPO_URL"
+          
+          # Find the JAR file with our app name and version
+          JAR_FILE=$(find target -name "${APP_NAME}-${VERSION%.+*}.jar" | head -n 1)
+          
+          if [ -z "$JAR_FILE" ]; then
+            echo "Error: Could not find JAR file for ${APP_NAME}-${VERSION%.+*}.jar"
+            exit 1
+          fi
+          
+          # Deploy to Artifactory using curl for more control over artifact naming
+          curl -u ${ARTIFACTORY_USERNAME}:${ARTIFACTORY_PASSWORD} \
+            -X PUT \
+            -T "$JAR_FILE" \
+            "${REPO_URL}/${APP_NAME}/${VERSION%.+*}/${APP_NAME}-${VERSION%.+*}.jar"
+          
+          # Also deploy to Maven repo using standard Maven deploy if pom.xml exists
+          if [ -f "pom.xml" ]; then
+            mvn deploy:deploy-file -DskipTests \
+              -DartifactId=${APP_NAME} \
+              -Dversion=${VERSION%.+*} \
+              -Dfile=${JAR_FILE} \
+              -DrepositoryId=artifactory \
+              -Durl=${REPO_URL} \
+              -DgeneratePom=true
+          fi
+  
+  containerize:
+    name: Build and Push Container
+    needs: [version, build]
+    if: ${{ inputs.containerize }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}
+          path: target/
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.aws_access_key_id }}
+          aws-secret-access-key: ${{ secrets.aws_secret_access_key }}
+          aws-region: us-east-1
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+      
+      - name: Determine ECR Repository
+        id: ecr-repo
+        env:
+          VERSION_CATEGORY: ${{ needs.version.outputs.version_category }}
+        run: |
+          # Determine ECR repository based on version category
+          if [[ "$VERSION_CATEGORY" == "alpha" || "$VERSION_CATEGORY" == "dev" ]]; then
+            # Alpha and dev versions go to development ECR
+            echo "repository=your-dev-repository" >> $GITHUB_OUTPUT
+          elif [[ "$VERSION_CATEGORY" == "rc" || "$VERSION_CATEGORY" == "beta" ]]; then
+            # RC and beta versions go to staging ECR
+            echo "repository=your-staging-repository" >> $GITHUB_OUTPUT
+          else
+            # Release versions go to production ECR
+            echo "repository=your-prod-repository" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.repository }}:${{ needs.version.outputs.new_version }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.ecr-repo.outputs.repository }}:latest
+          build-args: |
+            JAR_FILE=target/*.jar
+            VERSION=${{ needs.version.outputs.new_version }}
+  
+  create_release:
+    name: Create GitHub Release
+    needs: [version, build]
+    if: ${{ needs.version.outputs.version_changed == 'true' && needs.version.outputs.version_category == 'release' }}
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ github.event.repository.name }}-${{ needs.version.outputs.new_version }}
+          path: ./artifacts/
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ needs.version.outputs.new_version }}
+          name: Release v${{ needs.version.outputs.new_version }}
+          draft: false
+          prerelease: ${{ needs.version.outputs.is_prerelease == 'true' }}
+          files: |
+            ./artifacts/*-${{ needs.version.outputs.new_version }}.jar
+          generate_release_notes: true
