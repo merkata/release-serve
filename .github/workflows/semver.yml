@@ -231,7 +231,7 @@ jobs:
           npm version ${{ steps.semantic_release.outputs.new_version }} --no-git-tag-version
       
       - name: Create Git Tag
-        if: ${{ steps.semantic_release.outputs.version_changed == 'true' }}
+        if: ${{ steps.semantic_release.outputs.version_changed == 'true' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/heads/release/')) }}
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
