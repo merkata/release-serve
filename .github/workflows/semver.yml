@@ -114,7 +114,7 @@ jobs:
               }],
               "@semantic-release/release-notes-generator",
               ["@semantic-release/exec", {
-                "prepareCmd": "echo 'NEXT_VERSION=${nextRelease.version}' >> $GITHUB_ENV"
+                "verifyReleaseCmd": "echo 'NEXT_VERSION=${nextRelease.version}' >> $GITHUB_ENV"
               }]
             ]
           }
