@@ -70,7 +70,6 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: ${{ inputs.node_version }}
-          cache: 'npm'
       
       - name: Update Version
         if: ${{ needs.version.outputs.version_changed == 'true' }}
